@@ -1,0 +1,770 @@
+---
+title: "pdac_80"
+author: "Haiding.Wang"
+date: "2025-01-23"
+output: html_document
+---
+###Load data
+```{r}
+setwd("D:/STAGEM2/TCGA")
+```
+
+
+```{r}
+library(readr)
+library(data.table)
+library(rjson)
+library(Seurat)
+library(dplyr)
+library(clustree)
+library(ggplot2)
+library(ggpubr)
+library(survival)
+library(survminer)
+library(EnhancedVolcano)
+library(pheatmap)
+library(patchwork)
+library(clusterProfiler)
+library(org.Hs.eg.db)  
+library(enrichplot)
+library(circlize)
+```
+
+
+```{r}
+all_files <- list.files("D:/STAGEM2/TCGA/PDAC2", pattern = ".tsv", full.names = TRUE, recursive = TRUE)
+head(all_files)
+```
+
+```{r}
+metadata <- fromJSON(file = "D:/STAGEM2/TCGA/PDAC-2/metadata.cart.2025-01-23.json")
+```
+
+```{r}
+clinical <- fread("D:/STAGEM2/TCGA/PDAC-2/clinical.tsv") %>% 
+  as.data.frame() %>% 
+  distinct(case_id, .keep_all = TRUE)
+
+```
+
+
+
+### Intergret expression matrix
+```{r}
+paad_expre <-  do.call(cbind, lapply(all_files, function(x){
+  tmp = read.table(x, sep = "\t", skip = 6, header = FALSE)
+  tmp = tmp[,4]
+}))
+dim(paad_expre)
+```
+### add ensemble_id and gene_id
+```{r}
+tmp <-  read.table(all_files[1], sep = "\t", skip = 6)
+gene_id <- tmp[,2]
+rownames(paad_expre) <- gene_id
+```
+### add colnames
+```{r}
+col_names <- strsplit(all_files, split = "/")
+head(col_names,2)
+```
+
+```{r}
+col_names <- sapply(col_names, function(x){x[6]})
+colnames(paad_expre) <- col_names
+```
+
+
+```{r}
+colnames <- data.frame(file_name = sapply(metadata, function(x) x$file_name),
+                       sample_id = sapply(metadata, function(x) x$associated_entities[[1]]$entity_submitter_id),
+                       case_id = sapply(metadata, function(x) x$associated_entities[[1]]$case_id),
+                       stringsAsFactors = FALSE)
+colnames <- colnames[order(colnames$file_name),]
+paad_expre <- paad_expre[,order(colnames(paad_expre))]
+identical(colnames$file_name, colnames(paad_expre))
+```
+##### echange the colnames of matrix to gene_id
+```{r}
+colnames(paad_expre) <- colnames$sample_id
+paad_expre <- as.matrix(paad_expre)
+paad_expre[1:4,1:4]
+```
+
+#### clinical_df
+```{r}
+clinical_df <- clinical[match(colnames$case_id, clinical$case_id),]
+identical(clinical_df$case_id, colnames$case_id)
+```
+
+#### Seurat
+```{r}
+paad_expre <- as.data.frame(paad_expre)
+seurat_obj <- CreateSeuratObject(paad_expre, meta.data = metadata)
+```
+#### QC
+```{r}
+VlnPlot(seurat_obj, feature = "nCount_RNA", ncol = 1)
+```
+
+#### normalize
+```{r}
+seurat_obj <- NormalizeData(seurat_obj, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+```{r}
+seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000)
+dim(seurat_obj)
+```
+
+```{r}
+all_genes <- rownames(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj, features = all_genes, verbose = FALSE)
+```
+
+
+```{r}
+seurat_obj <- RunPCA(seurat_obj, assay = "RNA", npcs = 50)
+ElbowPlot(seurat_obj, ndims = 40)
+```
+
+
+```{r}
+seurat_obj <- RunUMAP(seurat_obj, dims = 1:32)
+```
+##### clustering
+```{r}
+seurat_obj <- FindNeighbors(seurat_obj, dims = 1:15)
+for (i in seq(0.1,1,0.1)){
+  seurat_obj <- FindClusters(seurat_obj, resolution = i)
+}
+```
+
+```{r fig.height=4, fig.width=6}
+clustree(seurat_obj, layout = "sugiyama")
+```
+
+
+```{r}
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.6)
+```
+
+
+```{r}
+seurat_obj$seurat_clusters <- ifelse(seurat_obj$seurat_clusters == "0", "Group1", "Group2")
+Idents(seurat_obj) <- seurat_obj$seurat_clusters
+```
+
+```{r}
+table(seurat_obj$seurat_clusters)
+```
+
+```{r}
+DimPlot(seurat_obj, reduction = "umap", group.by = "seurat_clusters", pt.size = 2) +
+  ggtitle("UMAP of 80 TCGA-PAAD clusters")
+```
+##### Feature plots
+```{r}
+FeaturePlot(seurat_obj, features = c("TP53", "PD-L1", "KRAS", "CDKN2A", "SMAD4")) 
+```
+
+```{r}
+VlnPlot(seurat_obj, features = c("TP53", "PD-L1", "KRAS", "CDKN2A", "SMAD4"), group.by = "seurat_clusters" )
+```
+```{r}
+library <- c("SFTPA2", "FAT2", "LINC00942","SCGB3A2","CLCA2","S100A12", "ALDH6A1", "GPLD1", "ACADSB", "DBH-AS1", "TDO2", "SHLD2P3")
+library %in% rownames(paad_expre)
+```
+```{r fig.width= 12, fig.height= 12}
+FeaturePlot(object = seurat_obj, reduction = "umap", features = library, ncol = 3, pt.size = 2)
+```
+
+##### Feature analysis
+
+
+```{r}
+umap_coords <- as.data.frame(Embeddings(seurat_obj, reduction = "umap"))
+umap_coords$cluster <- seurat_obj$seurat_clusters
+umap_coords$case_id <- clinical_df$case_id
+```
+
+
+```{r}
+combined_data <- merge(umap_coords, clinical_df, by = "case_id", all.x = TRUE)
+combined_data <- combined_data[match(colnames$case_id, combined_data$case_id),]
+identical(combined_data$case_id,colnames$case_id )
+```
+
+```{r}
+features <- c("age_at_index", "days_to_birth",  "age_at_diagnosis")
+titles <-  c("age_at_index", "days_to_birth",  "age_at_diagnosis")
+```
+
+
+```{r}
+Idents(seurat_obj) <- seurat_obj$seurat_clusters
+```
+
+
+```{r}
+
+box_plot <- lapply(features, function(x) {ggplot(combined_data, aes(x = cluster, y = !!sym(x), fill = cluster)) +
+  geom_boxplot(outlier.size = 0.5) +
+  scale_fill_manual(values = c("Group1" = "yellow", "Group2" = "pink")) +
+  labs(title = x, y = x, fill = "Cluster") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14))+
+  stat_compare_means(method = "wilcox.test", label = "p.format") 
+        })
+
+```
+
+```{r fig.width= 12, fig.height= 4}
+
+box_plot[[1]] | box_plot[[2]] | box_plot[[3]] 
+```
+```{r}
+umap_plot1 <-  lapply(features, function(x) {ggplot(
+  combined_data, aes(x = umap_1, y = umap_2, color = !! sym(x))) +
+    geom_point(size = 2) +
+    scale_color_viridis_c()+
+    labs(paste0(x, "_UMAP"), color = x) +
+    theme_minimal() +
+    theme(plot.tiltle = element_text(hjust = 0.5, size = 14))})
+```
+
+```{r fig.height= 4}
+umap_plot1[[1]] 
+umap_plot1[[2]] 
+umap_plot1[[3]]
+```
+
+
+```{r}
+features2 <- c("ethnicity", "gender", "race", "vital_status", "ajcc_pathologic_t")
+#for (i in features2){
+  #combined_data[,i] <- factor(combined_data[,i])
+#}
+titles2 <- c("ethnicity", "gender", "race", "vital_status", "ajcc_pathologic_t")
+umap_plot <- lapply(features2, function(x){ggplot(combined_data, aes(x = umap_1, y = umap_2, color = !!sym(x))) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = paste0(x, "_UMAP"), color = x) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14))})
+
+```
+
+```{r fig.height = 4}
+umap_plot[[1]] 
+umap_plot[[2]] 
+umap_plot[[3]] 
+umap_plot[[4]]  
+umap_plot[[5]]
+```
+
+
+### Differential expression analysis
+#dplyr
+```{r}
+library(dplyr)
+dea.cluster <- FindAllMarkers(seurat_obj,
+               only.pos = TRUE,
+               min.pct = 0.25,
+               logfc.threshold = 0.25
+               )
+```
+
+```{r}
+dea.cluster.filtered <- dea.cluster %>%
+  filter(p_val_adj < 0.05) %>% 
+  filter(abs(avg_log2FC) > 1) %>% 
+  group_by(cluster) %>%                      
+  arrange(desc(avg_log2FC), .by_group = TRUE)
+
+head(dea.cluster.filtered, 10)
+```
+
+```{r}
+dim(dea.cluster.filtered)
+```
+
+```{r, fig.height= 10}
+top10_genes <- dea.cluster.filtered %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+DoHeatmap(
+  seurat_obj,
+  dea.cluster.filtered$gene,
+  size = 3
+) 
+```
+
+```{r fig.width= 12, fig.height=12}
+FeaturePlot(seurat_obj, features = top10_genes$gene, ncol = 3)
+```
+
+#### Function enrichiment
+```{r}
+DotPlot(seurat_obj,
+        features = top10_genes$gene,
+        ) +RotatedAxis()
+```
+```{r}
+ego_seurat <- enrichGO(
+  gene = dea.cluster.filtered$gene,  
+  OrgDb = org.Hs.eg.db,      
+  keyType = "SYMBOL",        
+  ont = "ALL",               
+  pAdjustMethod = "BH",      
+  pvalueCutoff = 0.05,       
+)
+
+
+```
+
+```{r}
+barplot(ego_seurat,showCategory = 10, title = "GO Enrichiment")
+```
+
+#### DESeq2
+```{r}
+install.packages("BiocManager")
+BiocManager::install("DESeq2")
+```
+
+```{r}
+library(DESeq2)
+library(rlang)
+```
+
+#DESeqDataSet
+```{r}
+table(seurat_obj$seurat_clusters)
+
+```
+
+```{r}
+count_matrix <- paad_expre[rowMeans(paad_expre,) > 1,] %>% 
+  round() %>% 
+  as.data.frame()
+
+meta_data =  data.frame(
+  row.names = colnames(count_matrix),
+  cluster_group = seurat_obj$seurat_clusters
+)
+meta_data$cluster_group <- factor(meta_data$cluster_group, levels = c("Group1", "Group2"))
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  countData = as.matrix(count_matrix),
+  colData = meta_data,
+  design = ~ cluster_group
+)
+```
+
+```{r}
+barplot(rowSums(counts(dds)))
+range(rowSums(counts(dds)))
+
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(
+  countData = as.matrix(count_matrix),
+  colData = meta_data,
+  design = ~ cluster_group
+)
+dds_filtered  <- dds[rowSums(counts(dds)) >1e+04 & rowSums(counts(dds)) <5e+05,]
+dim(dds_filtered )
+```
+
+```{r}
+dds_filtered  <- estimateSizeFactors(dds_filtered )
+normalized_counts <- counts(dds_filtered , normalized = TRUE)
+```
+
+
+```{r}
+log_transformed <- log2(normalized_counts+1)
+range(log_transformed)
+```
+
+```{r}
+hist(rowSums(log_transformed), breaks = 50, main = "Log-transformed Gene Expression")
+```
+
+
+```{r}
+dds_filtered  <- DESeq(dds_filtered )
+```
+
+##### Results
+```{r}
+res <- results(dds_filtered , contrast = c("cluster_group", "Group1", "Group2"))
+```
+
+
+```{r}
+resOrdered <- res[order(res$log2FoldChange),]
+DEG_res <- as.data.frame(resOrdered)
+```
+
+
+```{r}
+DEG_res$group  <- "Stable"
+DEG_res$group[DEG_res$padj < 0.05 & DEG_res$log2FoldChange > 1] <- "Up"
+DEG_res$group[DEG_res$padj < 0.05 & DEG_res$log2FoldChange < -1] <- "Down"
+```
+
+
+```{r}
+table(DEG_res$group)
+```
+
+
+#### Save results
+```{r}
+setwd("D:/STAGEM2/TCGA")
+save(dds, res, DEG_res, file = c("PDAC_DESeq.Rdata"))
+```
+
+
+```{r}
+setwd("D:/STAGEM2/TCGA")
+write.table(DEG_res, file = "pdac_80_DEG_res.tsv", sep = "\t", row.names = TRUE)
+```
+####
+```{r}
+ggplot(DEG_res, aes(x = log2FoldChange, y = -log10(padj), color = group), labels(rownames(DEG_res))) +
+  geom_point(alpha = 0.8) +
+  scale_color_manual(values = c("blue", "grey", "red")) +
+  labs(title = "Volcano Plot of Differential Expression",
+       x = "Log2 Fold Change",
+       y = "-Log10 Adjusted P-value") +
+  theme_minimal()
+```
+
+```{r fig.width= 12, fig.height= 10}
+EnhancedVolcano(DEG_res,
+                lab = rownames(DEG_res),
+                selectLab = c("CASP14","LY6D","LYPD2","CCN6","CGB5","KRT6A","SEZ6","SYT5","SERPINA10","IRX2","CELA3A","RBPJL"),
+                x = 'log2FoldChange',
+                y = "padj",
+                pointSize = 4.0,
+                labSize = 5.0,
+                colAlpha = 1,
+                legendPosition =  "right"
+                )
+```
+
+
+```{r}
+paad_expre <- as.data.frame(paad_expre)
+DEG_res_sig <- DEG_res[which(DEG_res$group == "Up" | DEG_res$group == "Down"), ]  
+DEG_gene_list <- rownames(DEG_res_sig)
+expr_DEG_matrix <- paad_expre[DEG_gene_list,]
+expr_DEG_matrix_scaled <- t(scale(t(expr_DEG_matrix))) 
+expr_DEG_matrix_scaled[1:4,1:4]
+```
+
+```{r}
+DEG_Group1 <- res %>%
+  as.data.frame() %>%
+  filter(padj < 0.05 & log2FoldChange > 1) %>%
+  arrange(desc(log2FoldChange)) %>%  
+  head(6) 
+```
+
+```{r}
+DEG_Group2 <- res %>%
+  as.data.frame() %>%
+  filter(padj < 0.05 & log2FoldChange < -1) %>%
+  arrange(log2FoldChange) %>%  
+  head(6)  
+rownames(DEG_Group2)
+```
+
+```{r}
+columns_with_value <- colnames(expr_DEG_matrix_scaled)[apply(expr_DEG_matrix_scaled, 2, function(col) max(expr_DEG_matrix_scaled) %in% col)]
+rownames_with_values <- rownames(expr_DEG_matrix_scaled)[apply(expr_DEG_matrix_scaled, 1,function(col) max(expr_DEG_matrix_scaled))]
+print(columns_with_value); print(unique(rownames_with_values))
+```
+
+```{r}
+range(expr_DEG_matrix_scaled)
+```
+
+
+```{r}
+sample_group <- meta_data$cluster_group
+annotation_col <- data.frame(Cluster = sample_group) 
+rownames(annotation_col) <- colnames(expr_DEG_matrix_scaled)
+
+sorted_indices <- order(annotation_col$Cluster)
+sorted_counts <- expr_DEG_matrix_scaled[,sorted_indices] %>% 
+  as.data.frame()
+sorted_annotations <- annotation_col[sorted_indices, , drop = FALSE]
+annotation_color <- list(Cluster = c("Group1" = "#F8766D", "Group2" = "#00BFC4"))
+```
+
+```{r fig.width=8, fig.height=6}
+library(pheatmap)
+
+
+pheatmap(
+  sorted_counts,
+  annotation_col = sorted_annotations,
+  annotation_colors = annotation_color,
+  breaks = seq(-2,2,length.out = 10),
+  cluster_rows = FALSE,  
+  cluster_cols = FALSE, 
+  show_colnames = FALSE,
+  show_rownames = FALSE,
+  color = colorRampPalette(c("blue","white", "red"))(10),  
+  main = "Differentially Expressed Genes Heatmap"
+)
+
+```
+
+```{r}
+library(ComplexHeatmap)
+
+sample_group <- data.frame(Cluster = Idents(seurat_obj))
+rownames(sample_group) <- colnames(seurat_obj)
+sample_group$Cluster <- as.factor(sample_group$Cluster)
+column_split <- sample_group$Cluster
+# 样本注释
+ha <- HeatmapAnnotation(df = sample_group, col = list(Cluster = c("Group1" = "#F8766D", "Group2" = "#00BFC4")))
+
+# 绘制热图
+heat <- Heatmap(
+  expr_DEG_matrix_scaled,
+  name = "Differentially Expressed Genes Heatmap",
+  top_annotation = ha,
+  show_row_names = FALSE,
+  show_column_names = FALSE,
+  cluster_rows = FALSE,
+  cluster_columns = FALSE,
+  column_split = column_split,
+  col = colorRamp2(c(-2, -1, 0, 1, 2),c("blue", "lightblue", "white", "pink", "red")),
+  show_heatmap_legend = FALSE
+)
+heat
+```
+
+```{r}
+ggsave("HeatMap.png", plot = heat, width = 10, height = 6, dpi = 300)
+```
+
+
+#### Function enrichiment
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+BiocManager::install(c("clusterProfiler", "org.Hs.eg.db", "enrichplot"))
+
+
+
+```
+
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)  
+library(enrichplot)
+```
+
+
+
+
+```{r}
+ego <- enrichGO(
+  gene = DEG_gene_list,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "ALL",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+)
+
+```
+
+```{r}
+dotplot(ego, showCategory = 10, title = "GO Enrichiment")
+```
+
+#### Survial analysis
+```{r}
+library(survival)
+library(survminer)
+```
+
+```{r}
+group_info <- data.frame(
+  group = seurat_obj$seurat_clusters,
+  sample_id = colnames$sample_id
+)
+```
+
+```{r}
+merge_clinical_data <- merge(clinical_df, colnames, by = "case_id", all.x =TRUE)
+```
+
+```{r}
+merge_clinical_data <- merge(merge_clinical_data, group_info, by.x = "sample_id", by.y = "sample_id")
+merge_clinical_data <- merge_clinical_data[match(colnames$case_id, merge_clinical_data$case_id),]
+```
+
+```{r}
+merge_clinical_data$vital_status <- ifelse(merge_clinical_data$vital_status == "Dead", 1, 0)
+```
+
+```{r}
+merge_clinical_data$days_to_birth <- as.numeric(merge_clinical_data$days_to_birth)
+merge_clinical_data$days_to_death <- as.numeric(merge_clinical_data$days_to_death)
+```
+```{r}
+merge_clinical_data$survial <- as.numeric(ifelse(merge_clinical_data$vital_status == 0, merge_clinical_data$days_to_last_follow_up, merge_clinical_data$days_to_death))
+```
+
+```{r}
+merge_clinical_data$race <- as.factor(merge_clinical_data$race)
+```
+
+```{r}
+merge_clinical_data$survial
+
+```
+
+```{r}
+merge_clinical_data$survial <- ifelse(merge_clinical_data$survial == 9.0, NA, merge_clinical_data$survial)
+merge_clinical_data$survial
+```
+
+```{r}
+surv_obj <- Surv(time = merge_clinical_data$survial, event = merge_clinical_data$vital_status )
+fit <- survfit(surv_obj ~ group, data = merge_clinical_data)
+```
+
+
+```{r, fig.height= 6, fig.width=6}
+ggsurvplot(
+  fit,
+  data = merge_clinical_data,
+  pval = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  legend.labs = c("Group1", "Group2"),
+  legend.title = "Group"
+)
+```
+
+```{r}
+cox_model_multi <- coxph(surv_obj ~ group + gender +race, data = merge_clinical_data)
+
+```
+
+
+```{r}
+summary(cox_model_multi)
+```
+
+
+```{r}
+group1_GO <- rownames(DEG_Group1)
+group2_GO <- rownames(DEG_Group2)
+
+ego_Group1 <- enrichGO(
+  gene = group1_GO,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "ALL",  
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+ego_Group2 <- enrichGO(
+  gene = group2_GO,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "ALL",  
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+```
+
+```{r}
+# 提取 GO 结果（前6个通路）
+ego_Group1_df <- as.data.frame(ego_Group1)[1:5, c("Description", "p.adjust")]
+ego_Group2_df <- as.data.frame(ego_Group2)[1:5, c("Description", "p.adjust")]
+
+# 计算 -log10(p-value)
+ego_Group1_df$log_p <- -log10(ego_Group1_df$p.adjust)
+ego_Group1_df$Group <- "Group1"
+
+ego_Group2_df$log_p <- -log10(ego_Group2_df$p.adjust)
+ego_Group2_df$Group <- "Group2"
+
+# 合并数据
+# 让 Group1 和 Group2 的 GO term 排列一致
+GO_data <- merge(ego_Group1_df, ego_Group2_df, by = "Description", all = TRUE)
+
+# 重命名列
+colnames(GO_data) <- c("GO_Term", "pval_Group1", "log_p_Group1", "Group1", "pval_Group2", "log_p_Group2", "Group2")
+
+```
+
+```{r}
+library(ggplot2)
+
+GO_data_long <- data.frame(
+  GO_Term = c(ego_Group1_df$Description, ego_Group2_df$Description),
+  log_p = c(ego_Group1_df$log_p, ego_Group2_df$log_p),  # 负值表示 Group2
+  Group = c(rep("Group1", nrow(ego_Group1_df)), rep("Group2", nrow(ego_Group2_df)))
+)
+
+# 确保 GO_Term 顺序是按照 log_p 值排序
+GO_data_long <- GO_data_long %>%
+  arrange(desc(abs(log_p)))  # 按 -log10(p) 排序
+
+
+# 画条形图（并排展示）
+ontology <- ggplot(GO_data_long, aes(x = log_p, y = reorder(GO_Term, log_p), fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +  # "dodge" 让柱子并排
+  scale_fill_manual(values = c("Group1" = "#F8766D", "Group2" = "#00BFC4")) +  # 颜色
+  labs(title = "Gene Ontology Enrichment", x = "-log10(p-value)", y = "GO Terms") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 10))
+
+ontology
+```
+```{r}
+ggsave("GO_Enrichment_DualBarPlot.png", plot = ontology, width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+DEG_top <- DEG_res %>%
+  arrange(desc(log2FoldChange)) %>%
+  head(6) %>%
+  bind_rows(
+    DEG_res %>%
+      arrange(log2FoldChange) %>%
+      head(6)
+  )
+DEG_genes <- rownames(DEG_top)
+print(DEG_genes)
+```
+
+```{r fig.width= 12, fig.height=16}
+
+p <- FeaturePlot(seurat_obj, features = DEG_genes, ncol = 3)
+p
+```
+
+```{r}
+ggsave("FeaturePlot_UMAP.png", plot = p, width = 12, height = 16, dpi = 300)
+```
+
